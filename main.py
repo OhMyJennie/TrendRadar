@@ -413,121 +413,192 @@ class PushRecordManager:
 
 # === 数据获取 ===
 class DataFetcher:
-    """数据获取器"""
+    """数据获取器（支持平台级自定义 API 配置）"""
 
     def __init__(self, proxy_url: Optional[str] = None):
         self.proxy_url = proxy_url
 
+    def _find_platform_config(self, id_value: str) -> Dict:
+        for p in CONFIG.get("PLATFORMS", []):
+            if p.get("id") == id_value:
+                return p
+        return {}
+
     def fetch_data(
         self,
-        id_info: Union[str, Tuple[str, str]],
+        id_info: Union[str, Tuple[str, str], Dict],
         max_retries: int = 2,
         min_retry_wait: int = 3,
         max_retry_wait: int = 5,
     ) -> Tuple[Optional[str], str, str]:
-        """获取指定ID数据，支持重试"""
-        if isinstance(id_info, tuple):
+        # 兼容三种入参：platform dict / (id, name) / id
+        platform = {}
+        if isinstance(id_info, dict):
+            platform = id_info
+            id_value = platform.get("id")
+            alias = platform.get("name", id_value)
+        elif isinstance(id_info, tuple):
             id_value, alias = id_info
+            platform = self._find_platform_config(id_value)
         else:
             id_value = id_info
             alias = id_value
+            platform = self._find_platform_config(id_value)
 
-        url = f"https://newsnow.busiyi.world/api/s?id={id_value}&latest"
-
-        proxies = None
-        if self.proxy_url:
-            proxies = {"http": self.proxy_url, "https": self.proxy_url}
-
+        api_url = platform.get(
+            "api_url", f"https://newsnow.busiyi.world/api/s?id={id_value}&latest"
+        )
+        method = platform.get("method", "GET").upper()
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+            "User-Agent": platform.get(
+                "user_agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            ),
             "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-            "Connection": "keep-alive",
-            "Cache-Control": "no-cache",
         }
+        headers.update(platform.get("headers", {}))
+
+        params = platform.get("params", {})
+        body = platform.get("body", None)
+
+        proxies = {"http": self.proxy_url, "https": self.proxy_url} if self.proxy_url else None
 
         retries = 0
         while retries <= max_retries:
             try:
-                response = requests.get(
-                    url, proxies=proxies, headers=headers, timeout=10
-                )
-                response.raise_for_status()
+                if method == "GET":
+                    resp = requests.get(api_url, headers=headers, params=params, proxies=proxies, timeout=15)
+                else:
+                    if isinstance(body, dict):
+                        resp = requests.request(method, api_url, headers=headers, params=params, json=body, proxies=proxies, timeout=15)
+                    else:
+                        resp = requests.request(method, api_url, headers=headers, params=params, data=body, proxies=proxies, timeout=15)
 
-                data_text = response.text
-                data_json = json.loads(data_text)
+                resp.raise_for_status()
+                text = resp.text
 
-                status = data_json.get("status", "未知")
-                if status not in ["success", "cache"]:
-                    raise ValueError(f"响应状态异常: {status}")
+                # 原 newsnow 检查兼容
+                try:
+                    j = resp.json()
+                    if api_url.startswith("https://newsnow.busiyi.world") and isinstance(j, dict):
+                        status = j.get("status", "未知")
+                        if status not in ["success", "cache"]:
+                            raise ValueError(f"响应状态异常: {status}")
+                except Exception:
+                    pass
 
-                status_info = "最新数据" if status == "success" else "缓存数据"
-                print(f"获取 {id_value} 成功（{status_info}）")
-                return data_text, id_value, alias
+                print(f"获取 {id_value} 成功（{api_url}）")
+                return text, id_value, alias
 
             except Exception as e:
                 retries += 1
                 if retries <= max_retries:
-                    base_wait = random.uniform(min_retry_wait, max_retry_wait)
-                    additional_wait = (retries - 1) * random.uniform(1, 2)
-                    wait_time = base_wait + additional_wait
-                    print(f"请求 {id_value} 失败: {e}. {wait_time:.2f}秒后重试...")
+                    wait_time = random.uniform(min_retry_wait, max_retry_wait) + (retries - 1) * random.uniform(1, 2)
+                    print(f"请求 {id_value} 失败: {e}，{wait_time:.1f}s 后重试...")
                     time.sleep(wait_time)
                 else:
-                    print(f"请求 {id_value} 失败: {e}")
+                    print(f"请求 {id_value} 最终失败: {e}")
                     return None, id_value, alias
         return None, id_value, alias
 
     def crawl_websites(
         self,
-        ids_list: List[Union[str, Tuple[str, str]]],
+        ids_list: List[Union[str, Tuple[str, str], Dict]],
         request_interval: int = CONFIG["REQUEST_INTERVAL"],
     ) -> Tuple[Dict, Dict, List]:
-        """爬取多个网站数据"""
+        """爬取多个平台，支持 platform 配置化解析（items_path/title_field/url_field 等）"""
         results = {}
         id_to_name = {}
         failed_ids = []
 
+        def get_by_path(obj, path: str, default=None):
+            if not path:
+                return default
+            cur = obj
+            for part in path.split("."):
+                if isinstance(cur, dict) and part in cur:
+                    cur = cur[part]
+                else:
+                    return default
+            return cur
+
         for i, id_info in enumerate(ids_list):
-            if isinstance(id_info, tuple):
+            if isinstance(id_info, dict):
+                platform = id_info
+                id_value = platform.get("id")
+                name = platform.get("name", id_value)
+            elif isinstance(id_info, tuple):
                 id_value, name = id_info
+                platform = self._find_platform_config(id_value)
             else:
                 id_value = id_info
                 name = id_value
+                platform = self._find_platform_config(id_value)
 
             id_to_name[id_value] = name
-            response, _, _ = self.fetch_data(id_info)
+            resp_text, _, _ = self.fetch_data(platform if platform else id_value)
+            if not resp_text:
+                failed_ids.append(id_value)
+                if i < len(ids_list) - 1:
+                    time.sleep(max(50, request_interval + random.randint(-10, 20)) / 1000)
+                continue
 
-            if response:
+            # 尝试解析 JSON
+            try:
+                data = json.loads(resp_text)
+            except Exception:
+                print(f"解析 {id_value} 响应失败（非 JSON）")
+                failed_ids.append(id_value)
+                if i < len(ids_list) - 1:
+                    time.sleep(max(50, request_interval + random.randint(-10, 20)) / 1000)
+                continue
+
+            # 支持 items_path（默认 items），若不存在尝试常见字段（articles）
+            items_path = platform.get("items_path", "items")
+            items = get_by_path(data, items_path, default=None)
+            if items is None:
+                # 常见备选：articles, data.articles, items, data.items
+                for alt in ["articles", "data.articles", "data.items", "items"]:
+                    items = get_by_path(data, alt, default=None)
+                    if items is not None:
+                        break
+            if items is None:
+                items = []
+
+            results[id_value] = {}
+            title_field = platform.get("title_field", "title")
+            url_field = platform.get("url_field", "url")
+            mobile_field = platform.get("mobile_field", "mobileUrl")
+            source_name_field = platform.get("source_name_field", "sourceName")
+
+            # 对 articles 格式（例如示例）兼容：若条目包含 sourceId/sourceName/domain 等，仍提取 title/url
+            for idx, item in enumerate(items, 1):
                 try:
-                    data = json.loads(response)
-                    results[id_value] = {}
-                    for index, item in enumerate(data.get("items", []), 1):
-                        title = item["title"]
-                        url = item.get("url", "")
-                        mobile_url = item.get("mobileUrl", "")
+                    if isinstance(item, dict):
+                        title = item.get(title_field) or item.get("title") or ""
+                        url = item.get(url_field, "")
+                        mobile_url = item.get(mobile_field, "")
+                    else:
+                        title = str(item)
+                        url = ""
+                        mobile_url = ""
 
-                        if title in results[id_value]:
-                            results[id_value][title]["ranks"].append(index)
-                        else:
-                            results[id_value][title] = {
-                                "ranks": [index],
-                                "url": url,
-                                "mobileUrl": mobile_url,
-                            }
-                except json.JSONDecodeError:
-                    print(f"解析 {id_value} 响应失败")
-                    failed_ids.append(id_value)
+                    if not title:
+                        continue
+
+                    if title in results[id_value]:
+                        results[id_value][title]["ranks"].append(idx)
+                    else:
+                        results[id_value][title] = {"ranks": [idx], "url": url, "mobileUrl": mobile_url}
                 except Exception as e:
-                    print(f"处理 {id_value} 数据出错: {e}")
-                    failed_ids.append(id_value)
-            else:
+                    print(f"处理 {id_value} 第{idx}条数据出错: {e}")
+
+            if not results[id_value]:
+                print(f"{id_value} 未提取到任何条目")
                 failed_ids.append(id_value)
 
             if i < len(ids_list) - 1:
-                actual_interval = request_interval + random.randint(-10, 20)
-                actual_interval = max(50, actual_interval)
-                time.sleep(actual_interval / 1000)
+                time.sleep(max(50, request_interval + random.randint(-10, 20)) / 1000)
 
         print(f"成功: {list(results.keys())}, 失败: {failed_ids}")
         return results, id_to_name, failed_ids
@@ -2082,78 +2153,7 @@ def render_html_content(
     html += """</span>
                     </div>
                     <div class="info-item">
-                        <span class="info-label">新闻总数</span>
-                        <span class="info-value">"""
-
-    html += f"{total_titles} 条"
-
-    # 计算筛选后的热点新闻数量
-    hot_news_count = sum(len(stat["titles"]) for stat in report_data["stats"])
-
-    html += """</span>
-                    </div>
-                    <div class="info-item">
-                        <span class="info-label">热点新闻</span>
-                        <span class="info-value">"""
-
-    html += f"{hot_news_count} 条"
-
-    html += """</span>
-                    </div>
-                    <div class="info-item">
-                        <span class="info-label">生成时间</span>
-                        <span class="info-value">"""
-
-    now = get_beijing_time()
-    html += now.strftime("%m-%d %H:%M")
-
-    html += """</span>
-                    </div>
-                </div>
-            </div>
-            
-            <div class="content">"""
-
-    # 处理失败ID错误信息
-    if report_data["failed_ids"]:
-        html += """
-                <div class="error-section">
-                    <div class="error-title">⚠️ 请求失败的平台</div>
-                    <ul class="error-list">"""
-        for id_value in report_data["failed_ids"]:
-            html += f'<li class="error-item">{html_escape(id_value)}</li>'
-        html += """
-                    </ul>
-                </div>"""
-
-    # 处理主要统计数据
-    if report_data["stats"]:
-        total_count = len(report_data["stats"])
-
-        for i, stat in enumerate(report_data["stats"], 1):
-            count = stat["count"]
-
-            # 确定热度等级
-            if count >= 10:
-                count_class = "hot"
-            elif count >= 5:
-                count_class = "warm"
-            else:
-                count_class = ""
-
-            escaped_word = html_escape(stat["word"])
-
-            html += f"""
-                <div class="word-group">
-                    <div class="word-header">
-                        <div class="word-info">
-                            <div class="word-name">{escaped_word}</div>
-                            <div class="word-count {count_class}">{count} 条</div>
-                        </div>
-                        <div class="word-index">{i}/{total_count}</div>
-                    </div>"""
-
-            # 处理每个词组下的新闻标题，给每条新闻标上序号
+                       
             for j, title_data in enumerate(stat["titles"], 1):
                 is_new = title_data.get("is_new", False)
                 new_class = "new" if is_new else ""
